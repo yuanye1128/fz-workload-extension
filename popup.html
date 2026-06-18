@@ -1,0 +1,21 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>FZ 工单工作量统计</title>
+    <link rel="stylesheet" href="popup.css" />
+  </head>
+  <body>
+    <main>
+      <h1>FZ 工单工作量统计</h1>
+      <p>打开知识库工单列表页后，点击下面按钮在页面右下角打开统计面板。</p>
+      <button id="openPanel" type="button">打开统计面板</button>
+      <p id="message" role="status"></p>
+      <footer>
+        支持统计“待测试 / 已完成”，同一工单重复命中只算 1 个。
+      </footer>
+    </main>
+    <script src="popup.js"></script>
+  </body>
+</html>

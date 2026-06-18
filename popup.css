@@ -1,0 +1,57 @@
+/* 与页面内面板统一的方正橙主色 */
+body {
+  --kb-brand: #e65a28;
+
+  width: 300px;
+  margin: 0;
+  color: #1f2933;
+  font: 14px/1.45 -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+}
+
+main {
+  display: grid;
+  gap: 12px;
+  padding: 16px;
+}
+
+h1 {
+  margin: 0;
+  font-size: 17px;
+}
+
+p {
+  margin: 0;
+  color: #667085;
+}
+
+button {
+  border: 0;
+  border-radius: 9px;
+  background: var(--kb-brand);
+  color: #ffffff;
+  cursor: pointer;
+  font: inherit;
+  font-weight: 600;
+  padding: 10px 12px;
+}
+
+button:disabled {
+  cursor: not-allowed;
+  opacity: 0.55;
+}
+
+#message {
+  min-height: 20px;
+  color: #b84218;
+}
+
+#message.error {
+  color: #b53a10;
+}
+
+footer {
+  border-top: 1px solid #edf0f2;
+  color: #98a2b3;
+  font-size: 12px;
+  padding-top: 10px;
+}

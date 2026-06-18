@@ -1,0 +1,20 @@
+{
+  "manifest_version": 3,
+  "name": "FZ 工单工作量统计",
+  "version": "0.1.0",
+  "description": "统计知识库工单由本人改为待测试/已完成的月度工作量。",
+  "permissions": ["activeTab", "storage", "scripting"],
+  "host_permissions": ["https://kb.fzyun.net/*"],
+  "action": {
+    "default_title": "FZ 工单工作量统计",
+    "default_popup": "popup.html"
+  },
+  "content_scripts": [
+    {
+      "matches": ["https://kb.fzyun.net/*"],
+      "js": ["content.js"],
+      "css": ["content.css"],
+      "run_at": "document_idle"
+    }
+  ]
+}
