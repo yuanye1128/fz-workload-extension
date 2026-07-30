@@ -5,7 +5,9 @@
   /** 活动/列表中的工单号：半角 # 或全角 ＃ */
   const ISSUE_REF_IN_TEXT = /(?:#|＃)\d{3,}/;
   const MAX_LIST_PAGES = 200;
-  const DETAIL_FETCH_CONCURRENCY = 4;
+  /** 工单详情并发拉取数（同域 HTTP/1.1 浏览器约 6 路，略高可吃满队列） */
+  const DETAIL_FETCH_CONCURRENCY = 8;
+  const SCAN_UI_THROTTLE_MS = 200;
 
   let activeScan = null;
 
@@ -33,7 +35,6 @@
       <header class="kb-workload-header">
         <div>
           <strong>FZ 工单工作量统计</strong>
-          <span>按历史记录统计本人改为待测试/已完成的工单</span>
         </div>
         <button type="button" data-action="close" aria-label="关闭">×</button>
       </header>
@@ -284,6 +285,12 @@
       const rows = [];
       const seenKeys = new Set();
       const progress = { completed: 0, total: issueUrls.length, failed: 0 };
+      const ui = createThrottledUpdater(() => {
+        setStatus(
+          panel,
+          `正在扫描历史记录 ${progress.completed}/${progress.total}（并发 ${DETAIL_FETCH_CONCURRENCY}），已命中 ${rows.length} 条，失败 ${progress.failed} 个。`
+        );
+      }, SCAN_UI_THROTTLE_MS);
 
       await processIssueDetails(issueUrls, scan, async (issueUrl, index) => {
         try {
@@ -296,10 +303,7 @@
 
           if (matches.length === 0) {
             progress.completed += 1;
-            setStatus(
-              panel,
-              `正在扫描历史记录 ${progress.completed}/${progress.total}，已命中 ${rows.length} 条，失败 ${progress.failed} 个。`
-            );
+            ui.schedule();
             return;
           }
 
@@ -337,7 +341,6 @@
               operator: earliest.operator,
               orderIndex: index
             });
-            renderResults(panel, sortRows(rows));
           }
         } catch (error) {
           progress.failed += 1;
@@ -345,11 +348,9 @@
         }
 
         progress.completed += 1;
-        setStatus(
-          panel,
-          `正在扫描历史记录 ${progress.completed}/${progress.total}，已命中 ${rows.length} 条，失败 ${progress.failed} 个。`
-        );
+        ui.schedule();
       });
+      ui.flush();
 
       if (scan.cancelled) {
         setStatus(panel, "已停止");
@@ -421,11 +422,20 @@
       const rows = [];
       const seenKeys = new Set();
       const progress = { completed: 0, total: issueUrls.length, failed: 0, withTimeline: 0 };
+      const timingSamples = [];
+      const ui = createThrottledUpdater(() => {
+        setDetailedProgress(panel, progress, rows.length);
+      }, SCAN_UI_THROTTLE_MS);
 
+      setStatus(
+        panel,
+        `开始并发查询 ${issueUrls.length} 个工单详情（并发 ${DETAIL_FETCH_CONCURRENCY}）...`
+      );
+
+      const wallStartedAt = performance.now();
       await processIssueDetails(issueUrls, scan, async (issueUrl, index) => {
         try {
-          setDetailedProgress(panel, progress, rows.length, issueUrl);
-          const detail = await fetchIssueDetail(issueUrl);
+          const detail = await fetchIssueDetail(issueUrl, timingSamples);
           const timeline = extractStatusTimeline(detail.doc);
           if (timeline.length > 0) {
             progress.withTimeline += 1;
@@ -440,17 +450,21 @@
             seenKeys.add(dedupeKey);
             rows.push(row);
           }
-          if (settledRows.length > 0) {
-            renderResults(panel, sortRows(rows));
-          }
         } catch (error) {
           progress.failed += 1;
           console.warn("[KB Workload] detailed issue scan failed", issueUrl, error);
         }
 
         progress.completed += 1;
-        setDetailedProgress(panel, progress, rows.length);
+        ui.schedule();
       });
+      ui.flush();
+      const wallMs = performance.now() - wallStartedAt;
+      const timingStats = summarizeFetchTimings(timingSamples);
+      const timingText = formatTimingDiagnosis(timingStats, wallMs, DETAIL_FETCH_CONCURRENCY);
+      if (timingStats) {
+        console.info("[KB Workload] detailed scan timing", timingStats, timingText);
+      }
 
       if (scan.cancelled) {
         setStatus(panel, "已停止");
@@ -472,7 +486,7 @@
       });
       setStatus(
         panel,
-        `详细统计完成：命中 ${sortedRows.length} 条，扫描 ${issueUrls.length} 个工单详情，解析到状态历史 ${progress.withTimeline} 个，失败 ${progress.failed} 个。`
+        `详细统计完成：命中 ${sortedRows.length} 条，扫描 ${issueUrls.length} 个工单详情，解析到状态历史 ${progress.withTimeline} 个，失败 ${progress.failed} 个。${timingText ? ` ${timingText}` : ""}`
       );
     } catch (error) {
       console.error("[KB Workload] detailed scan failed", error);
@@ -971,8 +985,9 @@
     return "";
   }
 
-  async function fetchIssueDetail(url) {
-    const doc = await fetchDocument(url);
+  async function fetchIssueDetail(url, timingSamples) {
+    const fetchTiming = timingSamples ? {} : null;
+    const doc = await fetchDocument(url, fetchTiming);
     const path = new URL(url).pathname;
     const idFromPath = path.match(/\/issues\/(\d+)(?:\/|$)/i);
     const issueId = idFromPath?.[1] || path.split("/").filter(Boolean).pop() || "";
@@ -981,25 +996,72 @@
       text(doc.querySelector(".subject h3")) ||
       `#${issueId}`;
 
-    return { doc, issueId, title, tracker: extractTrackerFromIssueDoc(doc) };
+    const detail = { doc, issueId, title, tracker: extractTrackerFromIssueDoc(doc) };
+    if (fetchTiming && timingSamples) {
+      timingSamples.push(fetchTiming);
+    }
+    return detail;
   }
 
   async function processIssueDetails(issueUrls, scan, onIssue) {
     let cursor = 0;
-    const workers = Array.from(
-      { length: Math.min(DETAIL_FETCH_CONCURRENCY, issueUrls.length) },
-      async () => {
-        while (!scan.cancelled) {
-          const index = cursor;
-          cursor += 1;
-          if (index >= issueUrls.length) {
-            return;
+    const workerCount = Math.min(DETAIL_FETCH_CONCURRENCY, issueUrls.length);
+    const workers = Array.from({ length: workerCount }, async () => {
+      while (!scan.cancelled) {
+        const index = cursor;
+        cursor += 1;
+        if (index >= issueUrls.length) {
+          return;
+        }
+        await onIssue(issueUrls[index], index);
+      }
+    });
+    await Promise.all(workers);
+  }
+
+  function createThrottledUpdater(fn, intervalMs) {
+    let timer = null;
+    let dirty = false;
+    let lastRunAt = 0;
+
+    function run() {
+      dirty = false;
+      lastRunAt = Date.now();
+      fn();
+    }
+
+    return {
+      schedule() {
+        dirty = true;
+        const elapsed = Date.now() - lastRunAt;
+        if (elapsed >= intervalMs) {
+          if (timer) {
+            clearTimeout(timer);
+            timer = null;
           }
-          await onIssue(issueUrls[index], index);
+          run();
+          return;
+        }
+        if (timer) {
+          return;
+        }
+        timer = setTimeout(() => {
+          timer = null;
+          if (dirty) {
+            run();
+          }
+        }, Math.max(0, intervalMs - elapsed));
+      },
+      flush() {
+        if (timer) {
+          clearTimeout(timer);
+          timer = null;
+        }
+        if (dirty) {
+          run();
         }
       }
-    );
-    await Promise.all(workers);
+    };
   }
 
   function isActivityPage(doc) {
@@ -1074,9 +1136,10 @@
     };
   }
 
-  async function fetchDocument(url) {
+  async function fetchDocument(url, timingOut = null) {
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), 15000);
+    const t0 = performance.now();
     let response;
     try {
       response = await fetch(url, {
@@ -1090,8 +1153,79 @@
     if (!response.ok) {
       throw new Error(`请求失败 ${response.status}: ${url}`);
     }
+    const tHeaders = performance.now();
     const html = await response.text();
-    return new DOMParser().parseFromString(html, "text/html");
+    const tBody = performance.now();
+    const doc = new DOMParser().parseFromString(html, "text/html");
+    const tParse = performance.now();
+    if (timingOut) {
+      timingOut.ttfbMs = Math.round(tHeaders - t0);
+      timingOut.downloadMs = Math.round(tBody - tHeaders);
+      timingOut.networkMs = Math.round(tBody - t0);
+      timingOut.parseMs = Math.round(tParse - tBody);
+      timingOut.bytes = html.length;
+      timingOut.totalMs = Math.round(tParse - t0);
+    }
+    return doc;
+  }
+
+  function summarizeFetchTimings(samples) {
+    if (!samples || samples.length === 0) {
+      return null;
+    }
+    const pick = (key) => samples.map((s) => Number(s[key]) || 0).sort((a, b) => a - b);
+    const pct = (sorted, p) => {
+      if (!sorted.length) {
+        return 0;
+      }
+      const idx = Math.min(sorted.length - 1, Math.max(0, Math.ceil((p / 100) * sorted.length) - 1));
+      return sorted[idx];
+    };
+    const avg = (sorted) =>
+      sorted.length ? Math.round(sorted.reduce((sum, n) => sum + n, 0) / sorted.length) : 0;
+    const network = pick("networkMs");
+    const parse = pick("parseMs");
+    const total = pick("totalMs");
+    const bytes = pick("bytes");
+    const networkSum = network.reduce((sum, n) => sum + n, 0);
+    const parseSum = parse.reduce((sum, n) => sum + n, 0);
+    const bytesSum = bytes.reduce((sum, n) => sum + n, 0);
+    const slowCount = network.filter((n) => n >= 2000).length;
+    return {
+      count: samples.length,
+      networkAvg: avg(network),
+      networkP50: pct(network, 50),
+      networkP95: pct(network, 95),
+      networkMax: network[network.length - 1] || 0,
+      parseAvg: avg(parse),
+      parseP95: pct(parse, 95),
+      totalAvg: avg(total),
+      bytesAvg: avg(bytes),
+      bytesSum,
+      networkShare: networkSum + parseSum > 0 ? Math.round((networkSum / (networkSum + parseSum)) * 100) : 0,
+      slowCount
+    };
+  }
+
+  function formatTimingDiagnosis(stats, wallMs, concurrency) {
+    if (!stats) {
+      return "";
+    }
+    const mb = (stats.bytesSum / (1024 * 1024)).toFixed(1);
+    const wallSec = (wallMs / 1000).toFixed(1);
+    const bottleneck =
+      stats.networkShare >= 80
+        ? "主要瓶颈在知识库网络/服务端响应"
+        : stats.networkShare >= 50
+          ? "网络与本地解析都有开销，网络占更大头"
+          : "本地解析占比较高，可再优化解析路径";
+    return (
+      `耗时诊断：墙钟 ${wallSec}s，并发 ${concurrency}；` +
+      `单票网络均值 ${stats.networkAvg}ms / P50 ${stats.networkP50}ms / P95 ${stats.networkP95}ms / 最大 ${stats.networkMax}ms；` +
+      `DOM解析均值 ${stats.parseAvg}ms；` +
+      `下载约 ${mb}MB；网络占比约 ${stats.networkShare}%；` +
+      `≥2s 慢请求 ${stats.slowCount} 个。${bottleneck}。`
+    );
   }
 
   function extractMatchingChanges(doc, options) {
