@@ -5,6 +5,9 @@
   "description": "统计知识库工单由本人改为待测试/已完成的月度工作量。",
   "permissions": ["activeTab", "storage", "scripting"],
   "host_permissions": ["https://kb.fzyun.net/*"],
+  "background": {
+    "service_worker": "background.js"
+  },
   "action": {
     "default_title": "FZ 工单工作量统计",
     "default_popup": "popup.html"

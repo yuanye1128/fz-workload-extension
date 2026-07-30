@@ -11,6 +11,8 @@
 
   let activeScan = null;
 
+  const STORAGE_USER_ID_KEY = "kbWorkloadUserId";
+
   chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
     if (message?.type === "KB_WORKLOAD_OPEN_PANEL") {
       openPanel();
@@ -18,10 +20,23 @@
       return false;
     }
     if (message?.type === "KB_WORKLOAD_PING") {
-      sendResponse({ ok: true });
+      const userId = detectCurrentUserId();
+      if (userId) {
+        chrome.storage.local.set({ [STORAGE_USER_ID_KEY]: userId });
+      }
+      sendResponse({ ok: true, userId: userId || "" });
+      return false;
     }
     return false;
   });
+
+  // 进入知识库页面时尝试缓存当前用户 ID，供跳转「我的活动」使用
+  (() => {
+    const userId = detectCurrentUserId();
+    if (userId) {
+      chrome.storage.local.set({ [STORAGE_USER_ID_KEY]: userId });
+    }
+  })();
 
   function openPanel() {
     const existing = document.getElementById(PANEL_ID);
@@ -2205,6 +2220,38 @@
       const value = text(doc.querySelector(selector));
       if (value) {
         return value;
+      }
+    }
+    return "";
+  }
+
+  /** 从顶栏「登录为」用户链接解析 /users/123 */
+  function detectCurrentUserId(doc = document) {
+    const selectors = [
+      "#loggedas a.user",
+      ".loggedas a.user",
+      "#top-menu a.user",
+      "#account a.user",
+      "a.user.active"
+    ];
+    for (const selector of selectors) {
+      const nodes = Array.from(doc.querySelectorAll(selector));
+      for (const node of nodes) {
+        const href = node.getAttribute("href") || "";
+        const match = href.match(/\/users\/(\d+)(?:\/|$|\?)/);
+        if (match?.[1]) {
+          return match[1];
+        }
+      }
+    }
+
+    const loggedAs = doc.querySelector("#loggedas, .loggedas, #account");
+    if (loggedAs) {
+      const link = loggedAs.querySelector('a[href*="/users/"]');
+      const href = link?.getAttribute("href") || "";
+      const match = href.match(/\/users\/(\d+)(?:\/|$|\?)/);
+      if (match?.[1]) {
+        return match[1];
       }
     }
     return "";
