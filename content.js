@@ -484,9 +484,8 @@
               seenKeys.add(dedupeKey);
               rows.push(row);
             }
-          } catch (error) {
+          } catch (_) {
             progress.failed += 1;
-            console.warn("[KB Workload] detailed issue scan failed", issueUrl, error);
           }
 
           progress.completed += 1;
@@ -562,14 +561,14 @@
 
   /**
    * 详细统计是否收录该条活动为候选工单：
-   * 勾选月内全部收录；勾选月之前 lookback 内仅收录「待测试」（跨月结算依赖）。
+   * 勾选月内仅收录含待测试/已完成的活动；勾选月之前 lookback 内仅收录「待测试」。
    */
   function shouldCollectDetailedActivityCandidate(dateStr, months, statuses) {
-    if (!dateStr) {
+    if (!dateStr || !Array.isArray(statuses) || statuses.length === 0) {
       return false;
     }
     if (isInSelectedMonths(dateStr, months)) {
-      return true;
+      return statuses.some((status) => TARGET_STATUSES.includes(status));
     }
     const lookbackStart = activityLookbackStart(months);
     const monthStart = earliestMonthFirstDay(months);
@@ -579,7 +578,7 @@
     if (dateStr < lookbackStart || dateStr >= monthStart) {
       return false;
     }
-    return Array.isArray(statuses) && statuses.includes("待测试");
+    return statuses.includes("待测试");
   }
 
   function isInSelectedMonths(dateStr, months) {

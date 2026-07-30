@@ -32,11 +32,12 @@ function activityLookbackStart(months) {
 }
 
 function shouldCollectDetailedActivityCandidate(dateStr, months, statuses) {
-  if (!dateStr) {
+  const TARGET_STATUSES = ["待测试", "已完成"];
+  if (!dateStr || !Array.isArray(statuses) || statuses.length === 0) {
     return false;
   }
   if (isInSelectedMonths(dateStr, months)) {
-    return true;
+    return statuses.some((status) => TARGET_STATUSES.includes(status));
   }
   const lookbackStart = activityLookbackStart(months);
   const monthStart = earliestMonthFirstDay(months);
@@ -46,7 +47,7 @@ function shouldCollectDetailedActivityCandidate(dateStr, months, statuses) {
   if (dateStr < lookbackStart || dateStr >= monthStart) {
     return false;
   }
-  return Array.isArray(statuses) && statuses.includes("待测试");
+  return statuses.includes("待测试");
 }
 
 function settleDetailedIssueRows(detail, issueUrl, selectedMonths, username, orderIndex, timeline) {
@@ -177,7 +178,11 @@ function run() {
   // 勾选月内照常收录
   assert(
     shouldCollectDetailedActivityCandidate("2026-07-20", ["2026-07"], ["已完成"]) === true,
-    "勾选月内活动应收录"
+    "勾选月内已完成应收录"
+  );
+  assert(
+    shouldCollectDetailedActivityCandidate("2026-07-20", ["2026-07"], []) === false,
+    "勾选月内无状态活动不应收录"
   );
 
   // 往前多看 1 个月：仅勾选 7 月时，6 月待测试应收录
