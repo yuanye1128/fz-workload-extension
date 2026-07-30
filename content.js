@@ -409,8 +409,11 @@
     const monthLabel = `${formatMonthsLabel(months)}（详细统计）`;
 
     try {
-      const issueUrls = await collectDetailedIssueUrls(scope, months, scan, (text) => setStatus(panel, text));
-      if (issueUrls.length === 0) {
+      const collected = await collectDetailedScanInput(scope, months, scan, username, (text) =>
+        setStatus(panel, text)
+      );
+      const issueUrls = collected.issueUrls;
+      if (issueUrls.length === 0 && collected.shortcutRows.length === 0) {
         setStatus(panel, "未收集到可访问的工单详情地址，请确认当前页包含 /issues/ 工单链接或 #工单号。", true);
         return;
       }
@@ -421,50 +424,76 @@
 
       const rows = [];
       const seenKeys = new Set();
+      for (const row of collected.shortcutRows) {
+        const dedupeKey = `${row.issueId}|${normalizeUserName(row.operator)}|${row.monthKey}`;
+        if (seenKeys.has(dedupeKey)) {
+          continue;
+        }
+        seenKeys.add(dedupeKey);
+        rows.push(row);
+      }
+
       const progress = { completed: 0, total: issueUrls.length, failed: 0, withTimeline: 0 };
-      const timingSamples = [];
       const ui = createThrottledUpdater(() => {
         setDetailedProgress(panel, progress, rows.length);
       }, SCAN_UI_THROTTLE_MS);
 
+      const shortcutHint =
+        collected.skippedCompletedCount > 0
+          ? `，已完成短路径跳过 ${collected.skippedCompletedCount} 个`
+          : "";
       setStatus(
         panel,
-        `开始并发查询 ${issueUrls.length} 个工单详情（并发 ${DETAIL_FETCH_CONCURRENCY}）...`
+        `开始并发查询 ${issueUrls.length} 个工单详情（并发 ${DETAIL_FETCH_CONCURRENCY}${shortcutHint}）...`
       );
 
-      const wallStartedAt = performance.now();
-      await processIssueDetails(issueUrls, scan, async (issueUrl, index) => {
-        try {
-          const detail = await fetchIssueDetail(issueUrl, timingSamples);
-          const timeline = extractStatusTimeline(detail.doc);
-          if (timeline.length > 0) {
-            progress.withTimeline += 1;
-          }
-          const settledRows = settleDetailedIssueRows(detail, issueUrl, months, username, index, timeline);
-
-          for (const row of settledRows) {
-            const dedupeKey = `${row.issueId}|${normalizeUserName(row.operator)}|${row.monthKey}`;
-            if (seenKeys.has(dedupeKey)) {
-              continue;
+      const skipIssueIds = collected.skipIssueIds || new Set();
+      if (issueUrls.length > 0) {
+        await processIssueDetails(issueUrls, scan, async (issueUrl, index) => {
+          try {
+            const issueIdFromUrl = extractIssueIdFromPath(new URL(issueUrl, location.href).pathname);
+            if (issueIdFromUrl && skipIssueIds.has(issueIdFromUrl)) {
+              progress.completed += 1;
+              ui.schedule();
+              return;
             }
-            seenKeys.add(dedupeKey);
-            rows.push(row);
-          }
-        } catch (error) {
-          progress.failed += 1;
-          console.warn("[KB Workload] detailed issue scan failed", issueUrl, error);
-        }
 
-        progress.completed += 1;
-        ui.schedule();
-      });
-      ui.flush();
-      const wallMs = performance.now() - wallStartedAt;
-      const timingStats = summarizeFetchTimings(timingSamples);
-      const timingText = formatTimingDiagnosis(timingStats, wallMs, DETAIL_FETCH_CONCURRENCY);
-      if (timingStats) {
-        console.info("[KB Workload] detailed scan timing", timingStats, timingText);
+            const detail = await fetchIssueDetail(issueUrl);
+            const timeline = extractStatusTimeline(detail.doc);
+            if (timeline.length > 0) {
+              progress.withTimeline += 1;
+            }
+
+            // 详情里若勾选月已有「已完成」，后续同工单不再拉（并发队列兜底）
+            if (
+              detail.issueId &&
+              timeline.some(
+                (change) => change.status === "已完成" && isInSelectedMonths(change.changedAt, months)
+              )
+            ) {
+              skipIssueIds.add(detail.issueId);
+            }
+
+            const settledRows = settleDetailedIssueRows(detail, issueUrl, months, username, index, timeline);
+
+            for (const row of settledRows) {
+              const dedupeKey = `${row.issueId}|${normalizeUserName(row.operator)}|${row.monthKey}`;
+              if (seenKeys.has(dedupeKey)) {
+                continue;
+              }
+              seenKeys.add(dedupeKey);
+              rows.push(row);
+            }
+          } catch (error) {
+            progress.failed += 1;
+            console.warn("[KB Workload] detailed issue scan failed", issueUrl, error);
+          }
+
+          progress.completed += 1;
+          ui.schedule();
+        });
       }
+      ui.flush();
 
       if (scan.cancelled) {
         setStatus(panel, "已停止");
@@ -484,9 +513,13 @@
         username,
         rows: sortedRows
       });
+      const shortcutText =
+        collected.skippedCompletedCount > 0
+          ? `，已完成短路径 ${collected.skippedCompletedCount} 个（未拉详情）`
+          : "";
       setStatus(
         panel,
-        `详细统计完成：命中 ${sortedRows.length} 条，扫描 ${issueUrls.length} 个工单详情，解析到状态历史 ${progress.withTimeline} 个，失败 ${progress.failed} 个。${timingText ? ` ${timingText}` : ""}`
+        `详细统计完成：命中 ${sortedRows.length} 条，扫描 ${issueUrls.length} 个工单详情${shortcutText}，解析到状态历史 ${progress.withTimeline} 个，失败 ${progress.failed} 个。`
       );
     } catch (error) {
       console.error("[KB Workload] detailed scan failed", error);
@@ -511,6 +544,42 @@
       return "";
     }
     return `${months.slice().sort()[0]}-01`;
+  }
+
+  /** 详细统计活动候选往前看：最早勾选月往前 1 个月的 1 号 */
+  function activityLookbackStart(months) {
+    if (!months || months.length === 0) {
+      return "";
+    }
+    const earliest = months.slice().sort()[0];
+    const year = Number(earliest.slice(0, 4));
+    const month = Number(earliest.slice(5, 7));
+    const total = year * 12 + (month - 1) - 1;
+    const lookYear = Math.floor(total / 12);
+    const lookMonth = (total % 12) + 1;
+    return `${lookYear}-${String(lookMonth).padStart(2, "0")}-01`;
+  }
+
+  /**
+   * 详细统计是否收录该条活动为候选工单：
+   * 勾选月内全部收录；勾选月之前 lookback 内仅收录「待测试」（跨月结算依赖）。
+   */
+  function shouldCollectDetailedActivityCandidate(dateStr, months, statuses) {
+    if (!dateStr) {
+      return false;
+    }
+    if (isInSelectedMonths(dateStr, months)) {
+      return true;
+    }
+    const lookbackStart = activityLookbackStart(months);
+    const monthStart = earliestMonthFirstDay(months);
+    if (!lookbackStart || !monthStart) {
+      return false;
+    }
+    if (dateStr < lookbackStart || dateStr >= monthStart) {
+      return false;
+    }
+    return Array.isArray(statuses) && statuses.includes("待测试");
   }
 
   function isInSelectedMonths(dateStr, months) {
@@ -561,13 +630,44 @@
     return unique(urls);
   }
 
-  async function collectDetailedIssueUrls(scope, months, scan, onProgress) {
+  async function collectDetailedScanInput(scope, months, scan, username, onProgress) {
     const currentIssueUrl = getCurrentIssueUrl();
-    const urls = currentIssueUrl ? [currentIssueUrl] : [];
-    const collected = isActivityPage(document)
-      ? await collectActivityIssueUrls(months, scan, onProgress)
-      : await collectIssueUrls(scope, months, scan, onProgress);
-    return unique([...urls, ...collected].filter(isIssueDetailUrl));
+
+    if (isActivityPage(document)) {
+      const collectedActivity = await collectDetailedActivityCandidates(months, scan, onProgress);
+      const candidates = collectedActivity.candidates;
+      const shortcut = buildCompletedActivityShortcutRows(candidates, months, username);
+      const skipIssueIds = new Set([
+        ...shortcut.skipIssueIds,
+        ...collectedActivity.completedInSelectedMonths
+      ]);
+      const fetchUrls = unique(
+        candidates
+          .filter((item) => item.url && !skipIssueIds.has(item.issueId))
+          .map((item) => item.url)
+      );
+      if (currentIssueUrl) {
+        const currentId = extractIssueIdFromPath(new URL(currentIssueUrl).pathname);
+        if (currentId && !skipIssueIds.has(currentId)) {
+          fetchUrls.unshift(currentIssueUrl);
+        }
+      }
+      return {
+        issueUrls: fetchUrls.filter(isIssueDetailUrl),
+        shortcutRows: shortcut.rows,
+        skippedCompletedCount: skipIssueIds.size,
+        skipIssueIds
+      };
+    }
+
+    const collected = await collectIssueUrls(scope, months, scan, onProgress);
+    const urls = unique([...(currentIssueUrl ? [currentIssueUrl] : []), ...collected].filter(isIssueDetailUrl));
+    return {
+      issueUrls: urls,
+      shortcutRows: [],
+      skippedCompletedCount: 0,
+      skipIssueIds: new Set()
+    };
   }
 
   function isIssueDetailUrl(url) {
@@ -579,12 +679,67 @@
     }
   }
 
-  async function collectActivityIssueUrls(months, scan, onProgress) {
-    const urls = [];
+  /**
+   * 活动流里已显示「已完成」且落在勾选月：直接记当月，不再拉详情。
+   * （本版不补算更早的待测试贡献人。）
+   */
+  function buildCompletedActivityShortcutRows(candidates, selectedMonths, username) {
+    const rows = [];
+    const skipIssueIds = new Set();
+    const rowKeys = new Set();
+
+    (candidates || []).forEach((item, index) => {
+      if (!item?.issueId || !item.date) {
+        return;
+      }
+      if (!Array.isArray(item.statuses) || !item.statuses.includes("已完成")) {
+        return;
+      }
+      if (!isInSelectedMonths(item.date, selectedMonths)) {
+        return;
+      }
+
+      skipIssueIds.add(item.issueId);
+
+      const operator = item.operator || username;
+      if (!sameUser(operator, username)) {
+        return;
+      }
+
+      const monthKey = item.date.slice(0, 7);
+      const rowKey = `${item.issueId}|${normalizeUserName(operator)}|${monthKey}`;
+      if (rowKeys.has(rowKey)) {
+        return;
+      }
+      rowKeys.add(rowKey);
+      rows.push({
+        issueId: item.issueId,
+        monthKey,
+        title: item.title || `#${item.issueId}`,
+        url: item.url || `${location.origin}/issues/${item.issueId}`,
+        tracker: item.tracker || "",
+        matchedStatuses: "已完成",
+        firstChangedAt: item.date,
+        operator,
+        settledBy: operator,
+        settledAt: item.date,
+        contributionChangedAt: item.date,
+        orderIndex: item.orderIndex ?? index
+      });
+    });
+
+    return { rows, skipIssueIds };
+  }
+
+  async function collectDetailedActivityCandidates(months, scan, onProgress) {
+    const candidates = [];
+    const completedInSelectedMonths = new Set();
     const visitedPages = new Set();
-    const monthStart = earliestMonthFirstDay(months);
+    // 结算按「已完成」当月归属，但待测试可能发生在更早月份；需往前翻页收集待测试候选。
+    const lookbackStart = activityLookbackStart(months);
     const monthLabel = formatMonthsLabel(months);
     let pageUrl = new URL(location.href).href;
+    let orderIndex = 0;
 
     while (pageUrl) {
       if (scan.cancelled || visitedPages.has(pageUrl)) {
@@ -596,27 +751,53 @@
 
       const doc = pageUrl === location.href ? document : await fetchDocument(pageUrl);
       const root = findActivityStreamRoot(doc);
+      const pageOperator = detectCurrentUserName(doc);
       collectActivityEntryNodes(root).forEach((node) => {
         const rawText = normalizeWhitespace(text(node));
         const date = findActivityDate(node);
-        if (!isInSelectedMonths(date, months)) {
-          return;
-        }
         const issueLink = node.matches?.("a[href]") ? node : node.querySelector('a[href*="/issues/"]');
-        const url = normalizeIssueUrl(issueLink?.getAttribute("href"), pageUrl, rawText);
-        if (url) {
-          urls.push(url);
+        const url = normalizeIssueUrl(issueLink?.getAttribute("href"), pageUrl, rawText) || "";
+        const issueId =
+          getIssueIdFromEntryNode(node, pageUrl, rawText) ||
+          (url ? extractIssueIdFromPath(new URL(url, pageUrl).pathname) : "");
+        if (!issueId) {
           return;
         }
-        const issueId = getIssueIdFromEntryNode(node, pageUrl, rawText);
-        if (issueId) {
-          urls.push(`${location.origin}/issues/${issueId}`);
+
+        // 当月已出现过「已完成」：历史中再出现同一工单直接跳过，不再作为候选/拉详情
+        if (completedInSelectedMonths.has(issueId)) {
+          return;
         }
+
+        const statuses = extractStatusesFromText(rawText);
+        if (!shouldCollectDetailedActivityCandidate(date, months, statuses)) {
+          return;
+        }
+
+        if (
+          Array.isArray(statuses) &&
+          statuses.includes("已完成") &&
+          isInSelectedMonths(date, months)
+        ) {
+          completedInSelectedMonths.add(issueId);
+        }
+
+        const resolvedUrl = url || `${location.origin}/issues/${issueId}`;
+        candidates.push({
+          issueId,
+          url: resolvedUrl,
+          date,
+          statuses,
+          title: buildActivityTitle(rawText, issueId) || `#${issueId}`,
+          tracker: extractTrackerFromActivityText(rawText, issueId),
+          operator: pageOperator,
+          orderIndex: orderIndex++
+        });
       });
 
       const pageDates = extractActivityPageDates(doc);
-      if (pageDates.length > 0 && monthStart && pageDates.every((date) => date < monthStart)) {
-        onProgress(`活动页记录已早于所选月份 ${monthStart.slice(0, 7)}，停止继续翻页。`);
+      if (pageDates.length > 0 && lookbackStart && pageDates.every((date) => date < lookbackStart)) {
+        onProgress(`活动页记录已早于回看起点 ${lookbackStart.slice(0, 7)}，停止继续翻页。`);
         break;
       }
 
@@ -628,7 +809,7 @@
       pageUrl = collectPaginationLink(doc, pageUrl, "prev");
     }
 
-    return unique(urls);
+    return { candidates, completedInSelectedMonths };
   }
 
   function getCurrentIssueUrl() {
@@ -985,9 +1166,8 @@
     return "";
   }
 
-  async function fetchIssueDetail(url, timingSamples) {
-    const fetchTiming = timingSamples ? {} : null;
-    const doc = await fetchDocument(url, fetchTiming);
+  async function fetchIssueDetail(url) {
+    const doc = await fetchDocument(url);
     const path = new URL(url).pathname;
     const idFromPath = path.match(/\/issues\/(\d+)(?:\/|$)/i);
     const issueId = idFromPath?.[1] || path.split("/").filter(Boolean).pop() || "";
@@ -996,11 +1176,7 @@
       text(doc.querySelector(".subject h3")) ||
       `#${issueId}`;
 
-    const detail = { doc, issueId, title, tracker: extractTrackerFromIssueDoc(doc) };
-    if (fetchTiming && timingSamples) {
-      timingSamples.push(fetchTiming);
-    }
-    return detail;
+    return { doc, issueId, title, tracker: extractTrackerFromIssueDoc(doc) };
   }
 
   async function processIssueDetails(issueUrls, scan, onIssue) {
@@ -1136,10 +1312,9 @@
     };
   }
 
-  async function fetchDocument(url, timingOut = null) {
+  async function fetchDocument(url) {
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), 15000);
-    const t0 = performance.now();
     let response;
     try {
       response = await fetch(url, {
@@ -1153,79 +1328,8 @@
     if (!response.ok) {
       throw new Error(`请求失败 ${response.status}: ${url}`);
     }
-    const tHeaders = performance.now();
     const html = await response.text();
-    const tBody = performance.now();
-    const doc = new DOMParser().parseFromString(html, "text/html");
-    const tParse = performance.now();
-    if (timingOut) {
-      timingOut.ttfbMs = Math.round(tHeaders - t0);
-      timingOut.downloadMs = Math.round(tBody - tHeaders);
-      timingOut.networkMs = Math.round(tBody - t0);
-      timingOut.parseMs = Math.round(tParse - tBody);
-      timingOut.bytes = html.length;
-      timingOut.totalMs = Math.round(tParse - t0);
-    }
-    return doc;
-  }
-
-  function summarizeFetchTimings(samples) {
-    if (!samples || samples.length === 0) {
-      return null;
-    }
-    const pick = (key) => samples.map((s) => Number(s[key]) || 0).sort((a, b) => a - b);
-    const pct = (sorted, p) => {
-      if (!sorted.length) {
-        return 0;
-      }
-      const idx = Math.min(sorted.length - 1, Math.max(0, Math.ceil((p / 100) * sorted.length) - 1));
-      return sorted[idx];
-    };
-    const avg = (sorted) =>
-      sorted.length ? Math.round(sorted.reduce((sum, n) => sum + n, 0) / sorted.length) : 0;
-    const network = pick("networkMs");
-    const parse = pick("parseMs");
-    const total = pick("totalMs");
-    const bytes = pick("bytes");
-    const networkSum = network.reduce((sum, n) => sum + n, 0);
-    const parseSum = parse.reduce((sum, n) => sum + n, 0);
-    const bytesSum = bytes.reduce((sum, n) => sum + n, 0);
-    const slowCount = network.filter((n) => n >= 2000).length;
-    return {
-      count: samples.length,
-      networkAvg: avg(network),
-      networkP50: pct(network, 50),
-      networkP95: pct(network, 95),
-      networkMax: network[network.length - 1] || 0,
-      parseAvg: avg(parse),
-      parseP95: pct(parse, 95),
-      totalAvg: avg(total),
-      bytesAvg: avg(bytes),
-      bytesSum,
-      networkShare: networkSum + parseSum > 0 ? Math.round((networkSum / (networkSum + parseSum)) * 100) : 0,
-      slowCount
-    };
-  }
-
-  function formatTimingDiagnosis(stats, wallMs, concurrency) {
-    if (!stats) {
-      return "";
-    }
-    const mb = (stats.bytesSum / (1024 * 1024)).toFixed(1);
-    const wallSec = (wallMs / 1000).toFixed(1);
-    const bottleneck =
-      stats.networkShare >= 80
-        ? "主要瓶颈在知识库网络/服务端响应"
-        : stats.networkShare >= 50
-          ? "网络与本地解析都有开销，网络占更大头"
-          : "本地解析占比较高，可再优化解析路径";
-    return (
-      `耗时诊断：墙钟 ${wallSec}s，并发 ${concurrency}；` +
-      `单票网络均值 ${stats.networkAvg}ms / P50 ${stats.networkP50}ms / P95 ${stats.networkP95}ms / 最大 ${stats.networkMax}ms；` +
-      `DOM解析均值 ${stats.parseAvg}ms；` +
-      `下载约 ${mb}MB；网络占比约 ${stats.networkShare}%；` +
-      `≥2s 慢请求 ${stats.slowCount} 个。${bottleneck}。`
-    );
+    return new DOMParser().parseFromString(html, "text/html");
   }
 
   function extractMatchingChanges(doc, options) {
@@ -2209,7 +2313,7 @@
     }
     const months = selectedMonths && selectedMonths.length > 0 ? selectedMonths : [];
     const rowList = rows && rows.length > 0 ? rows : [];
-    const showChart = months.length > 1 && rowList.length > 0;
+    const showChart = months.length > 0 && rowList.length > 0;
     if (!showChart) {
       el.innerHTML = "";
       el.classList.add("kb-workload-month-chart--hidden");
