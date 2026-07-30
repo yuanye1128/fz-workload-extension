@@ -54,8 +54,8 @@
           <div class="kb-workload-month-grid" data-role="month-grid" role="group" aria-label="选择统计月份，可多选"></div>
         </div>
         <div class="kb-workload-actions">
-          <button type="button" data-action="scan">开始统计</button>
-          <button type="button" data-action="detailed-scan">详细统计</button>
+          <button type="button" data-action="scan" title="粗略统计：活动中改为「待测试」的工单数">提测工单数</button>
+          <button type="button" data-action="detailed-scan" title="按已完成结算，统计可计入工作量的工单（含待测试→已完成）">完成工作量</button>
           <button type="button" data-action="stop" disabled>停止</button>
           <button type="button" data-action="export-html" disabled>导出 HTML 报表</button>
         </div>
@@ -247,7 +247,7 @@
     renderResults(panel, []);
     renderMonthChart(panel, months, []);
     const monthsSet = new Set(months);
-    const monthLabel = formatMonthsLabel(months);
+    const monthLabel = `${formatMonthsLabel(months)}（提测工单数）`;
 
     try {
       if (isActivityPage(document)) {
@@ -271,7 +271,7 @@
         });
         setStatus(
           panel,
-          `统计完成：命中 ${activityResult.rows.length} 条（按月份+工单去重），扫描 ${activityResult.scannedLinks} 条工单活动，来自 ${activityResult.scannedPages} 个页面。`
+          `提测工单数统计完成：命中 ${activityResult.rows.length} 条（按月份+工单去重），扫描 ${activityResult.scannedLinks} 条工单活动，来自 ${activityResult.scannedPages} 个页面。`
         );
         return;
       }
@@ -372,11 +372,11 @@
       });
       setStatus(
         panel,
-        `统计完成：命中 ${sortedRows.length} 条，扫描 ${issueUrls.length} 个工单详情，失败 ${progress.failed} 个。`
+        `提测工单数统计完成：命中 ${sortedRows.length} 条，扫描 ${issueUrls.length} 个工单详情，失败 ${progress.failed} 个。`
       );
     } catch (error) {
       console.error("[KB Workload] scan failed", error);
-      setStatus(panel, `统计失败：${error.message || error}`, true);
+      setStatus(panel, `提测工单数统计失败：${error.message || error}`, true);
     } finally {
       setBusy(panel, false);
       activeScan = null;
@@ -403,10 +403,10 @@
     const scan = { cancelled: false };
     activeScan = scan;
     setBusy(panel, true);
-    setStatus(panel, "正在收集详细统计候选工单...");
+    setStatus(panel, "正在收集完成工作量候选工单...");
     renderResults(panel, []);
     renderMonthChart(panel, months, []);
-    const monthLabel = `${formatMonthsLabel(months)}（详细统计）`;
+    const monthLabel = `${formatMonthsLabel(months)}（完成工作量）`;
 
     try {
       const collected = await collectDetailedScanInput(scope, months, scan, username, (text) =>
@@ -518,11 +518,11 @@
           : "";
       setStatus(
         panel,
-        `详细统计完成：命中 ${sortedRows.length} 条，扫描 ${issueUrls.length} 个工单详情${shortcutText}，解析到状态历史 ${progress.withTimeline} 个，失败 ${progress.failed} 个。`
+        `完成工作量统计完成：命中 ${sortedRows.length} 条，扫描 ${issueUrls.length} 个工单详情${shortcutText}，解析到状态历史 ${progress.withTimeline} 个，失败 ${progress.failed} 个。`
       );
     } catch (error) {
       console.error("[KB Workload] detailed scan failed", error);
-      setStatus(panel, `详细统计失败：${error.message || error}`, true);
+      setStatus(panel, `完成工作量统计失败：${error.message || error}`, true);
     } finally {
       setBusy(panel, false);
       activeScan = null;
@@ -2352,10 +2352,10 @@
             ? `${escapeHtml(item.month)}: ${item.count} 条，环比 ${escapeHtml(item.mom)}`
             : `${escapeHtml(item.month)}: ${item.count} 条`;
         return `
-        <div class="kb-workload-bar-col" style="width:${w}%;" title="${tip}">
+        <div class="kb-workload-bar-col" style="width:${w}%; --bar-delay:${i * 45}ms;" title="${tip}">
           <div class="kb-workload-bar-viz" aria-hidden="true">
             <div class="kb-workload-bar-track">
-              <div class="kb-workload-bar-fill" style="height:${h}%;"></div>
+              <div class="kb-workload-bar-fill" data-target-height="${h}" style="height:0%;"></div>
             </div>
           </div>
           <div class="kb-workload-bar-meta">
@@ -2374,6 +2374,19 @@
       </div>
       <div class="kb-workload-chart-bars" role="img" aria-label="各月工单条数与环比">${bars}</div>
     </div>`;
+
+    requestAnimationFrame(() => {
+      requestAnimationFrame(() => {
+        el.querySelectorAll(".kb-workload-bar-fill[data-target-height]").forEach((fill) => {
+          const target = Number(fill.getAttribute("data-target-height")) || 0;
+          fill.style.height = `${target}%`;
+        });
+        el.querySelectorAll(".kb-workload-bar-col").forEach((col) => {
+          col.classList.add("is-in");
+        });
+        el.querySelector(".kb-workload-chart-card")?.classList.add("is-in");
+      });
+    });
   }
 
   function renderSummary(panel, summary) {
